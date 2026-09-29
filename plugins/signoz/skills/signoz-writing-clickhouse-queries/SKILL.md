@@ -17,8 +17,8 @@ description: >-
 
 Use this skill when the user asks for SigNoz queries involving:
 
-- Logs: severity, body text, log volume, structured fields, containers,
-  services, or environments.
+- Logs: severity, body text, keys inside a JSON log body, log volume,
+  structured fields, containers, services, or environments.
 - Traces: spans, latency, duration, p95 or p99, HTTP operations, DB
   operations, or error spans.
 - Dashboard panels: timeseries charts, value widgets, and table breakdowns.
@@ -65,6 +65,10 @@ syntax, dashboard templates, query examples, and a validation checklist.
 - Display conversion: `fromUnixTimestamp64Nano(timestamp)`.
 - Main table: `signoz_logs.distributed_logs_v2`.
 - Resource table: `signoz_logs.distributed_logs_v2_resource`.
+- Body column: `body` (String) on legacy and dual-ingestion tenants;
+  `body_v2` (JSON, with a typed `body_v2.message` String sub-column) on JSON
+  body tenants, where `body` is written empty. The logs reference has the
+  detection queries and every `body_v2` access pattern.
 
 ### Traces
 
@@ -91,6 +95,12 @@ syntax, dashboard templates, query examples, and a validation checklist.
   always use `signoz_logs.distributed_logs_v2`.
 - Traces query with `resources_string['service.name']` instead of
   `resource_string_service$$name`.
+- Logs query with `JSONExtractString(body, ...)` or `lower(body) LIKE` on a
+  JSON body tenant: `body` is empty there, so the panel shows no data. Read
+  keys with ``dynamicElement(body_v2.`key`, '<type>')`` and message
+  text with `body_v2.message`.
+- Bare `` body_v2.`key` `` compared to a literal, or a `body_v2` key filter
+  without `has(JSONAllPaths(body_v2), '<key>')`.
 
 ## Query Attribution
 
@@ -110,7 +120,10 @@ already has a `SETTINGS` clause, append `log_comment` to it with a comma.
 
 1. Detect the signal: logs or traces.
 2. Read the matching reference file before writing the query.
-3. Pick the panel type: timeseries, value, or table.
-4. Build the query using the required patterns from the reference.
-5. Append the `SETTINGS log_comment` attribution clause.
-6. Validate the result with the checklist in the reference.
+3. For logs, decide which body column the tenant uses (legacy `body` or
+   JSON `body_v2`) with the detection queries in the reference before writing
+   any body predicate.
+4. Pick the panel type: timeseries, value, or table.
+5. Build the query using the required patterns from the reference.
+6. Append the `SETTINGS log_comment` attribution clause.
+7. Validate the result with the checklist in the reference.
