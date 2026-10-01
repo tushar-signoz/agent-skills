@@ -3,7 +3,8 @@
 ## Contents
 
 - Table Schemas (`distributed_logs_v2`, `distributed_logs_v2_resource`)
-- Which Body Column Holds the Text (legacy `body` vs JSON `body_v2`)
+- Which Body Column Holds the Text (legacy `body` vs JSON `body_v2`: feature
+  flags over direct HTTP, SQL probe over MCP, ranges that cross the cut-over)
 - Mandatory Optimization Patterns
   - Resource Filter CTE
   - Timestamp Bucketing
@@ -88,37 +89,93 @@ Used in the resource filter CTE pattern for efficient filtering by resource attr
 
 ## Which Body Column Holds the Text
 
-SigNoz tenants store the log body in one of three ways. Pick the column before
-writing any body predicate, because a query against the wrong one returns no
+SigNoz tenants store the log body in one of three ways. Decide the mode before
+writing any body predicate, because a query against the wrong column returns no
 rows or fails.
 
 | Tenant mode | `body` | `body_v2` | Query the body through |
 |---|---|---|---|
 | Legacy (predates the JSON body migration) | populated | column absent | `body` |
-| Dual ingestion (`json_body_dual_ingestion`) | populated | populated | `body`; `body_v2` is available |
-| JSON body (`use_json_body`; SigNoz Cloud accounts created from May 2026 on `in2`, `eu2`, `us2`) | written empty | populated | `body_v2` |
+| Dual ingestion | populated | populated | `body`; `body_v2` is available |
+| JSON body (SigNoz Cloud accounts created from May 2026 on `in2`, `eu2`, `us2`) | written empty | populated | `body_v2` |
 
-Detect the mode with two queries. The first shows whether the column exists,
-the second which column carries text over a short recent window:
+Two detection paths exist, chosen by what the agent can reach:
+
+- Feature flags (Path 1) when the agent calls the SigNoz HTTP API directly
+  with an API key or a session, for example to build dashboard JSON or to
+  send `query_range` requests itself.
+- The SQL probe (Path 2) for any agent on the SigNoz MCP server: Claude Code,
+  another coding agent, or an agent running inside SigNoz. The MCP server has
+  no feature-flag tool, so the probe runs through `signoz_execute_builder_query`.
+  An in-product agent whose host already supplies the resolved flags should
+  use those and skip the probe.
+
+If the user names the tenant mode or pastes a schema, use that instead.
+
+### Path 1: feature flags (direct HTTP access)
+
+`GET /api/v2/features` returns every feature flag with its value resolved for
+the caller's org. Authenticate with the `SIGNOZ-API-KEY` header or a logged-in
+session. Two flags decide the body column:
+
+```sh
+curl -s -H "SIGNOZ-API-KEY: $SIGNOZ_API_KEY" "$SIGNOZ_URL/api/v2/features" \
+  | jq '.data[] | select(.name == "use_json_body" or .name == "json_body_dual_ingestion")
+        | {name, resolvedValue}'
+```
+
+| `use_json_body` | `json_body_dual_ingestion` | Mode |
+|---|---|---|
+| `true` | any | JSON body |
+| `false` | `true` | Dual ingestion |
+| `false` | `false` | Legacy |
+
+`use_json_body` is the switch the SigNoz query builder consults. With it on,
+`body.*` filters resolve to `body_v2` and a bare `body` search targets
+`body_v2.message`, so a custom SQL panel that follows the flag stays consistent
+with the Logs Explorer on the same tenant.
+
+### Path 2: SQL probe (any agent on the MCP server, or no API access)
+
+Run this through `signoz_execute_builder_query` or `POST /api/v5/query_range`
+as a `clickhouse_sql` envelope with `requestType: "scalar"` and a `start`/`end`
+window covering the last 15 minutes (see "Running the SQL" in SKILL.md). The
+backend fills the `$` variables from `start` and `end`.
 
 ```sql
-SELECT name, type
-FROM system.columns
-WHERE database = 'signoz_logs' AND table = 'distributed_logs_v2'
-  AND name IN ('body', 'body_v2', 'body_promoted');
-
 SELECT countIf(body != '') AS legacy_body_rows,
        countIf(body_v2.message != '') AS json_message_rows
 FROM signoz_logs.distributed_logs_v2
-WHERE timestamp >= toUnixTimestamp64Nano(now64() - INTERVAL 15 MINUTE)
-  AND ts_bucket_start >= toUnixTimestamp(now() - INTERVAL 45 MINUTE);
+WHERE timestamp >= $start_timestamp_nano AND timestamp <= $end_timestamp_nano
+  AND ts_bucket_start BETWEEN $start_timestamp - 1800 AND $end_timestamp
 ```
 
-If the user names a tenant or pastes a schema, use that instead of probing.
-When `json_message_rows > 0` and `legacy_body_rows = 0`, every body pattern
-in this file that mentions `body` must be written against `body_v2` as
-described in "JSON Body (`body_v2`)". `JSONExtractString(body, ...)` and
-`lower(body) LIKE ...` return nothing on such a tenant because `body` is empty.
+| Result | Mode |
+|---|---|
+| Error `Code: 47` (unknown identifier `body_v2`) | Legacy; the column does not exist |
+| `legacy_body_rows > 0` and `json_message_rows > 0` | Dual ingestion |
+| `legacy_body_rows = 0` and `json_message_rows > 0` | JSON body |
+| Both `0` | No logs in the window; widen it or ask the user |
+
+`SELECT name, type FROM system.columns WHERE database = 'signoz_logs' AND
+table = 'distributed_logs_v2' AND name LIKE 'body%'` answers the column
+question directly, but the ClickHouse user behind a managed tenant may lack
+access to `system.columns`. The count probe works on every tenant.
+
+### Panels whose range crosses the cut-over
+
+A flag flip does not rewrite history. On a tenant that moved to JSON bodies,
+rows ingested before the move keep their text in `body` and later rows in
+`body_v2`. Run the count probe over the panel's own range when the range
+starts before the move, and read text across both columns with
+`if(body != '', body, toString(body_v2))`. That expression engages no skip
+index, so reserve it for the crossing range and use the single-column
+patterns otherwise.
+
+When the mode is JSON body, every body pattern in this file that mentions
+`body` must be written against `body_v2` as described in "JSON Body
+(`body_v2`)". `JSONExtractString(body, ...)` and `lower(body) LIKE ...` return
+nothing on such a tenant because `body` is empty.
 
 ---
 
@@ -516,6 +573,13 @@ toStartOfInterval(fromUnixTimestamp64Nano(timestamp), INTERVAL 1 MINUTE) AS ts
 | `$end_timestamp_nano` | UInt64 | End of selected time range (nanoseconds) |
 | `$start_timestamp` | Int64 | Start as Unix timestamp (seconds) |
 | `$end_timestamp` | Int64 | End as Unix timestamp (seconds) |
+| `$start_timestamp_ms`, `$end_timestamp_ms` | Int64 | Same range in milliseconds |
+| `$start_datetime`, `$end_datetime` | DateTime | `toDateTime(<seconds>)`; for traces, never for the logs `timestamp` column |
+
+The same variables are filled from `start` and `end` when the SQL runs through
+`POST /api/v5/query_range` or `signoz_execute_builder_query`, so a panel query
+can be dry-run unchanged. Dashboard-defined variables travel in the request's
+`variables` map and substitute as `$name`, `{{name}}`, or `[[name]]`.
 
 ---
 
@@ -742,7 +806,7 @@ Before finalizing any query, verify:
 - [ ] **`GLOBAL IN`** is used (not plain `IN`) for the resource fingerprint subquery
 - [ ] Every non-aggregated projection, including computed expressions, appears in `GROUP BY`
 - [ ] **Indexed columns** used over map access where the attribute is a selected field
-- [ ] **Body column** matches the tenant mode: `body` on legacy and dual-ingestion tenants, `body_v2` on JSON body tenants (where `body` is empty)
+- [ ] **Body column** matches the tenant mode found through the feature flags (direct HTTP) or the SQL probe (MCP): `body` on legacy and dual-ingestion tenants, `body_v2` on JSON body tenants (where `body` is empty)
 - [ ] **Body searches** use `lower(body)` (not raw `body`) and `LIKE` (not `position` / `positionCaseInsensitive`); for OR'd patterns, a shared `hasToken` or `LIKE` is ANDed before the OR block
 - [ ] **JSON body keys** are read with ``dynamicElement(body_v2.`key`, '<type>')`` (never a bare `` body_v2.`key` `` compared to a literal), and message text with `body_v2.message`
 - [ ] **JSON body key filters** carry `has(JSONAllPaths(body_v2), '<key>')` so the path skip index engages

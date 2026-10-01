@@ -116,13 +116,43 @@ SETTINGS log_comment = 'signoz-writing-clickhouse-queries skill | YYYY-MM-DD'
 Replace `YYYY-MM-DD` with today's date (e.g., `2026-04-03`). If the query
 already has a `SETTINGS` clause, append `log_comment` to it with a comma.
 
+## Running the SQL
+
+Dashboards fill the `$start_*` and `$end_*` variables when a panel renders. To
+run or dry-run the same SQL outside a dashboard, wrap it in a `clickhouse_sql`
+envelope; the backend fills the same variables from `start` and `end` (epoch
+milliseconds):
+
+```json
+{
+  "schemaVersion": "v1",
+  "start": 1759300000000,
+  "end": 1759300900000,
+  "requestType": "time_series",
+  "compositeQuery": {
+    "queries": [
+      {"type": "clickhouse_sql", "spec": {"name": "A", "query": "<SQL>", "disabled": false}}
+    ]
+  }
+}
+```
+
+- Direct HTTP: `POST /api/v5/query_range` with the `SIGNOZ-API-KEY` header.
+- MCP: pass the same object as `query` to `signoz_execute_builder_query`.
+- `requestType`: `time_series` for `(ts, value)` rows, `scalar` for value and
+  table panels, `raw` for row listings.
+- Dashboard variables go in a top-level `variables` map; SigNoz runs the SQL
+  as written, so the tenant's ClickHouse grants are the only limit.
+
 ## Workflow
 
 1. Detect the signal: logs or traces.
 2. Read the matching reference file before writing the query.
 3. For logs, decide which body column the tenant uses (legacy `body` or
-   JSON `body_v2`) with the detection queries in the reference before writing
-   any body predicate.
+   JSON `body_v2`) before writing any body predicate: read `use_json_body`
+   from `GET /api/v2/features` when calling SigNoz over HTTP; on the SigNoz
+   MCP server (from Claude, another coding agent, or an agent inside SigNoz)
+   run the SQL probe from the reference through `signoz_execute_builder_query`.
 4. Pick the panel type: timeseries, value, or table.
 5. Build the query using the required patterns from the reference.
 6. Append the `SETTINGS log_comment` attribution clause.
